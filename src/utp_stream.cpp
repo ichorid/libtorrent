@@ -136,6 +136,12 @@ enum
 {
 	ACK_MASK = 0xffff,
 
+	// these minimum and maximum sizes of receive buffer
+	// to be used as floor and ceiling values by algorithm,
+	// that dynamically determines m_receive_buffer_capacity
+	receive_buffer_capacity_min = 1024*1024,
+	receive_buffer_capacity_max = 8 * receive_buffer_capacity_min,
+
 	// if a packet receives more than this number of
 	// duplicate acks, we'll trigger a fast re-send
 	dup_ack_limit = 3,
@@ -278,7 +284,7 @@ struct utp_socket_impl
 		, m_written(0)
 		, m_receive_buffer_size(0)
 		, m_read_buffer_size(0)
-		, m_receive_buffer_capacity(8 * 1024 * 1024)
+		, m_receive_buffer_capacity(receive_buffer_capacity_min)
 		, m_in_packets(0)
 		, m_out_packets(0)
 		, m_send_delay(0)
@@ -794,6 +800,23 @@ void utp_socket_drained(utp_socket_impl* s)
 
 	s->maybe_trigger_receive_callback();
 	s->maybe_trigger_send_callback();
+}
+
+boost::int32_t adjust_receive_buf_capacity(boost::uint32_t const rtt)
+{
+	// maximum value for RTT we would still scale for. We use it to clamp min_rtt 
+	// and to calculate the linear buffer increase coefficient
+	const boost::int32_t rtt_ceil = 800;
+
+	// linear buffer increase coefficient. Defines how fast
+	// m_receive_buffer_capacity would increase/decrease with increase/decrease of minimum RTT
+	const boost::int64_t k = (boost::int64_t(receive_buffer_capacity_max - receive_buffer_capacity_min)<<16) / rtt_ceil;
+
+	// clamp min_rtt to rtt_ceil and calculate new buffer size
+	const boost::int64_t clamped_rtt = std::min(boost::int32_t(rtt), rtt_ceil);
+	const boost::int32_t adjusted_buffer_size = receive_buffer_capacity_min + boost::int32_t((clamped_rtt * k)>>16);
+
+	return adjusted_buffer_size;
 }
 
 void utp_socket_impl::update_mtu_limits()
@@ -2445,6 +2468,8 @@ void utp_socket_impl::ack_packet(packet* p, time_point const& receive_time
 
 	m_rtt.add_sample(rtt / 1000);
 	if (rtt < min_rtt) min_rtt = rtt;
+	// tune receive buffer size according to the new RTT value
+	m_receive_buffer_capacity = adjust_receive_buf_capacity(m_rtt.mean()*1000);
 	free(p);
 }
 
@@ -2929,6 +2954,10 @@ bool utp_socket_impl::incoming_packet(boost::uint8_t const* buf, int size
 		++m_duplicate_acks;
 	}
 
+    // min_rtt is local to processing of this packet/ACK. It is named min_rtt, because in
+    // case of selective/multiple ACK we would need to calculate RTT for 
+    // each of the acknowledged packets, and use the lowest of those RTTs.
+    // It is used as a sanity check, to clamp calculated delay.
 	boost::uint32_t min_rtt = (std::numeric_limits<boost::uint32_t>::max)();
 
 	TORRENT_ASSERT(m_outbuf.at((m_acked_seq_nr + 1) & ACK_MASK) || ((m_seq_nr - m_acked_seq_nr) & ACK_MASK) <= 1);
@@ -3174,6 +3203,7 @@ bool utp_socket_impl::incoming_packet(boost::uint8_t const* buf, int size
 				// it's impossible for delay to be more than the RTT, so make
 				// sure to clamp it as a sanity check
 				if (delay > min_rtt) delay = min_rtt;
+
 
 				do_ledbat(acked_bytes, delay, prev_bytes_in_flight);
 				m_send_delay = delay;
