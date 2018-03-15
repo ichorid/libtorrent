@@ -182,6 +182,7 @@ int utp_socket_state(utp_socket_impl const* s);
 void utp_send_ack(utp_socket_impl* s);
 void utp_socket_drained(utp_socket_impl* s);
 void utp_writable(utp_socket_impl* s);
+boost::int32_t get_optimized_receive_buf_capacity(boost::uint32_t const rtt);
 
 // this is the user-level stream interface to utp sockets.
 // the reason why it's split up in a utp_stream class and

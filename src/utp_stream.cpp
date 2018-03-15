@@ -242,7 +242,14 @@ struct packet
 // its size is "m_read_buffer_size". The buffer we spill over
 // into when the user provided buffer is full or when there
 // is none, is "m_receive_buffer" and "m_receive_buffer_size"
-// respectively.
+// respectively. 
+
+// "m_receive_buffer_capacity" marks the maximum amount of
+// bytes receive buffer should store at once. If we
+// want to reduce this limit during runtime, we must be careful
+// not to reduce it below the window size we advertised
+// to our peer earlier. The number of bytes we want to 
+// reduce receive buffer by is stored in "m_receive_buffer_surplus". 
 
 // in order to know when to trigger the read and write handlers
 // there are two counters, m_read and m_written, which count
@@ -283,12 +290,14 @@ struct utp_socket_impl
 		, m_write_buffer_size(0)
 		, m_written(0)
 		, m_receive_buffer_size(0)
+		, m_receive_buffer_surplus(0)
 		, m_read_buffer_size(0)
 		, m_receive_buffer_capacity(receive_buffer_capacity_min)
 		, m_in_packets(0)
 		, m_out_packets(0)
 		, m_send_delay(0)
 		, m_recv_delay(0)
+		, m_min_rtt(std::numeric_limits<boost::int32_t>::max())
 		, m_close_reason(0)
 		, m_port(0)
 		, m_send_id(send_id)
@@ -379,6 +388,8 @@ struct utp_socket_impl
 	void experienced_loss(int seq_nr);
 
 	void set_state(int s);
+
+	void decrease_receive_buffer(int bytes);
 
 private:
 
@@ -529,6 +540,11 @@ public:
 	// the sum of all packets stored in m_receive_buffer
 	boost::int32_t m_receive_buffer_size;
 
+	// the number of bytes that receive buffer should be
+	// reduced by. Used to defer shrinkage of 
+	// m_receive_buffer_capacity.
+	boost::int32_t m_receive_buffer_surplus;
+
 	// the sum of all buffers in m_read_buffer
 	boost::int32_t m_read_buffer_size;
 
@@ -554,6 +570,9 @@ public:
 
 	// average RTT
 	sliding_average<16> m_rtt;
+
+	// lowest RTT observed during the whole existence time of connection
+	boost::int32_t m_min_rtt;
 
 	// if this is != 0, it means the upper layer provided a reason for why
 	// the connection is being closed. The reason is indicated by this
@@ -802,10 +821,10 @@ void utp_socket_drained(utp_socket_impl* s)
 	s->maybe_trigger_send_callback();
 }
 
-boost::int32_t adjust_receive_buf_capacity(boost::uint32_t const rtt)
+boost::int32_t get_optimized_receive_buf_capacity(boost::uint32_t const rtt)
 {
-	// maximum value for RTT we would still scale for. We use it to clamp min_rtt 
-	// and to calculate the linear buffer increase coefficient
+	// maximum value for RTT we would still scale for. We use it to clamp min_rtt
+	// and calculate linear buffer increase coefficient
 	const boost::int32_t rtt_ceil = 800;
 
 	// linear buffer increase coefficient. Defines how fast
@@ -1130,6 +1149,7 @@ size_t utp_stream::read_some(bool clear_buffers)
 		TORRENT_ASSERT(int(target->len) >= to_copy);
 		target->len -= to_copy;
 		m_impl->m_receive_buffer_size -= to_copy;
+		m_impl->decrease_receive_buffer(to_copy);
 		TORRENT_ASSERT(m_impl->m_read_buffer_size >= to_copy);
 		m_impl->m_read_buffer_size -= to_copy;
 		p->header_size += to_copy;
@@ -1524,6 +1544,23 @@ std::size_t utp_socket_impl::available() const
 	return m_receive_buffer_size;
 }
 
+
+void utp_socket_impl::decrease_receive_buffer(int const bytes)
+{
+	if (m_receive_buffer_surplus >= bytes)
+	{
+		// move higher buffer mark, so difference (window) between it and
+		// lower mark (m_receive_buffer_size) will remain the same
+		m_receive_buffer_surplus  -= bytes;
+		m_receive_buffer_capacity -= bytes;
+	}
+	else
+	{
+		m_receive_buffer_capacity -= m_receive_buffer_surplus;
+		m_receive_buffer_surplus = 0;
+	}
+}
+
 void utp_socket_impl::parse_close_reason(boost::uint8_t const* ptr, int size)
 {
 	if (size != 4) return;
@@ -1832,10 +1869,10 @@ bool utp_socket_impl::send_pkt(int const flags)
 	int sack = 0;
 	if (m_inbuf.size())
 	{
-        const int max_sack_size = effective_mtu 
-            - sizeof(utp_header)
-            - 2 // for sack padding/header
-            - (close_reason ? 6 : 0);
+		const int max_sack_size = effective_mtu 
+			- sizeof(utp_header)
+			- 2 // for sack padding/header
+			- (close_reason ? 6 : 0);
 
 		// the SACK bitfield should ideally fit all
 		// the pieces we have successfully received
@@ -2468,8 +2505,32 @@ void utp_socket_impl::ack_packet(packet* p, time_point const& receive_time
 
 	m_rtt.add_sample(rtt / 1000);
 	if (rtt < min_rtt) min_rtt = rtt;
-	// tune receive buffer size according to the new RTT value
-	m_receive_buffer_capacity = adjust_receive_buf_capacity(m_rtt.mean()*1000);
+
+	// update the all-time mininimum RTT value
+	if (m_min_rtt < min_rtt)
+	{
+		m_min_rtt = min_rtt;
+		// and tune receive buffer size according to it
+		boost::int32_t const new_capacity = get_optimized_receive_buf_capacity(m_min_rtt/1000);
+		// m_min_rtt should never increase, but the buffer size could be
+		// increased from its default value after the first RTT. The
+		// evolution of buffer size in accord with min_rtt happens like
+		// this:                       +------------------------------+-----------+----------------+
+		//                             | start                        | first RTT | following RTTs |
+		// +---------------------------+------------------------------+-----------+----------------+
+		// | min_rtt                   | std::numeric_limits<>::max() | decrease  | decrease       |
+		// +---------------------------+------------------------------+-----------+----------------+
+		// | m_receive_buffer_capacity | 1 MByte                      | increase  | decrease       |
+		// +---------------------------+------------------------------+-----------+----------------+
+		// We only use surplus mechanism if the capacity should really
+		// decrease. In case it should increase (e.g. after the first RTT),
+		// we change it directly.
+		if (new_capacity <= m_receive_buffer_capacity - m_receive_buffer_surplus)
+			m_receive_buffer_surplus += (m_receive_buffer_capacity - m_receive_buffer_surplus - new_capacity);
+		else
+			m_receive_buffer_capacity = new_capacity;
+	}
+
 	free(p);
 }
 
@@ -2954,10 +3015,10 @@ bool utp_socket_impl::incoming_packet(boost::uint8_t const* buf, int size
 		++m_duplicate_acks;
 	}
 
-    // min_rtt is local to processing of this packet/ACK. It is named min_rtt, because in
-    // case of selective/multiple ACK we would need to calculate RTT for 
-    // each of the acknowledged packets, and use the lowest of those RTTs.
-    // It is used as a sanity check, to clamp calculated delay.
+	// min_rtt is local to processing of this packet/ACK. It is named min_rtt, because in
+	// case of selective/multiple ACK we would need to calculate RTT for 
+	// each of the acknowledged packets, and use the lowest of those RTTs.
+	// It is used as a sanity check, to clamp calculated delay.
 	boost::uint32_t min_rtt = (std::numeric_limits<boost::uint32_t>::max)();
 
 	TORRENT_ASSERT(m_outbuf.at((m_acked_seq_nr + 1) & ACK_MASK) || ((m_seq_nr - m_acked_seq_nr) & ACK_MASK) <= 1);
