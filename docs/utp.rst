@@ -123,9 +123,15 @@ to packet loss the same way TCP does, also reacts to changes in delays.
 For any uTP (or LEDBAT_) implementation, there is a target delay. This is the
 amount of delay that is acceptable, and is in fact targeted for the connection.
 The target delay is defined to 25 ms in LEDBAT_, uTorrent uses 100 ms and
-libtorrent uses 75 ms. Whenever a delay measurement is lower than the target,
-cwnd is increased proportional to (target_delay - delay). Whenever the measurement
-is higher than the target, cwnd is decreased proportional to (delay - target_delay).
+libtorrent determines it dynamically, based on lowest seen RTT in session (min_rtt).
+It uses the formula::
+
+	target_delay = min(100ms, min_rtt/2)
+
+User can disable this mechanism by setting target_delay manually.
+Whenever a delay measurement is lower than the target, cwnd is increased proportional
+to (target_delay - delay). Whenever the measurement is higher than the target,
+cwnd is decreased proportional to (delay - target_delay).
 
 It can simply be expressed as::
 

@@ -153,7 +153,10 @@ enum
 	// less likely to loose the re-sent packet. Because
 	// when that happens, we must time-out in order
 	// to continue, which takes a long time.
-	sack_resend_limit = 1
+	sack_resend_limit = 1,
+
+    // minimal default target_delay.
+    default_target_delay = 100000
 };
 
 // compare if lhs is less than rhs, taking wrapping
@@ -3514,8 +3517,12 @@ void utp_socket_impl::do_ledbat(const int acked_bytes, const int delay
 	// rtt, or on every ACK scaled by the number of ACKs per rtt
 	TORRENT_ASSERT(in_flight > 0);
 	TORRENT_ASSERT(acked_bytes > 0);
+	// As we do it on rtt, we should already have a non-default m_min_rtt
+	TORRENT_ASSERT(m_min_rtt != (std::numeric_limits<boost::int32_t>::max()));
 
-	const int target_delay = (std::max)(1, m_sm->target_delay());
+    const int user_target_delay = m_sm->target_delay();
+	const int target_delay = user_target_delay != 0 ? (std::max)(1, user_target_delay):
+        (std::max)(m_min_rtt/2, (int)default_target_delay);
 
 	// true if the upper layer is pushing enough data down the socket to be
 	// limited by the cwnd. If this is not the case, we should not adjust cwnd.
