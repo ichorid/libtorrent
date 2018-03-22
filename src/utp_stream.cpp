@@ -248,8 +248,9 @@ struct packet
 // bytes receive buffer should store at once. If we
 // want to reduce this limit during runtime, we must be careful
 // not to reduce it below the window size we advertised
-// to our peer earlier. The number of bytes we want to 
-// reduce receive buffer by is stored in "m_receive_buffer_surplus". 
+// to our peer earlier. The new desired buffer capacity is stored 
+// in "m_desired_receive_buffer_capacity", and should be changed
+// only through "set_desired_receive_buf_capacity".
 
 // in order to know when to trigger the read and write handlers
 // there are two counters, m_read and m_written, which count
@@ -290,9 +291,9 @@ struct utp_socket_impl
 		, m_write_buffer_size(0)
 		, m_written(0)
 		, m_receive_buffer_size(0)
-		, m_receive_buffer_surplus(0)
 		, m_read_buffer_size(0)
 		, m_receive_buffer_capacity(receive_buffer_capacity_min)
+		, m_desired_receive_buffer_capacity(receive_buffer_capacity_min)
 		, m_in_packets(0)
 		, m_out_packets(0)
 		, m_send_delay(0)
@@ -387,6 +388,7 @@ struct utp_socket_impl
 	void update_mtu_limits();
 	void experienced_loss(int seq_nr);
 
+	void set_desired_receive_buf_capacity(boost::int32_t const new_capacity);
 	void set_state(int s);
 
 	void decrease_receive_buffer(int bytes);
@@ -540,16 +542,16 @@ public:
 	// the sum of all packets stored in m_receive_buffer
 	boost::int32_t m_receive_buffer_size;
 
-	// the number of bytes that receive buffer should be
-	// reduced by. Used to defer shrinkage of 
-	// m_receive_buffer_capacity.
-	boost::int32_t m_receive_buffer_surplus;
-
 	// the sum of all buffers in m_read_buffer
 	boost::int32_t m_read_buffer_size;
 
 	// max number of bytes to allocate for receive buffer
 	boost::int32_t m_receive_buffer_capacity;
+
+	// the number of bytes that receive buffer should be
+	// changed to. Used to defer shrinkage of 
+	// m_receive_buffer_capacity.
+	boost::int32_t m_desired_receive_buffer_capacity;
 
 	// this holds the 3 last delay measurements,
 	// these are the actual corrected delay measurements.
@@ -837,6 +839,21 @@ boost::int32_t get_optimized_receive_buf_capacity(boost::uint32_t const rtt)
 
 	return adjusted_buffer_size;
 }
+
+void utp_socket_impl::set_desired_receive_buf_capacity(boost::int32_t const new_capacity)
+{
+	TORRENT_ASSERT(new_capacity > 0);
+	if (new_capacity == m_desired_receive_buffer_capacity)
+		return;
+
+	m_desired_receive_buffer_capacity = new_capacity;
+	// We use deferred decrease mechanism if effective capacity should decrease, or
+	// if even after increase its capacity would be smaller than the size of its current contents.
+	// In case it should increase, we change it immediately,
+	m_receive_buffer_capacity = std::max(m_desired_receive_buffer_capacity, 
+			std::max(m_receive_buffer_size, m_receive_buffer_capacity));
+}
+
 
 void utp_socket_impl::update_mtu_limits()
 {
@@ -1547,18 +1564,12 @@ std::size_t utp_socket_impl::available() const
 
 void utp_socket_impl::decrease_receive_buffer(int const bytes)
 {
-	if (m_receive_buffer_surplus >= bytes)
-	{
-		// move higher buffer mark, so difference (window) between it and
-		// lower mark (m_receive_buffer_size) will remain the same
-		m_receive_buffer_surplus  -= bytes;
-		m_receive_buffer_capacity -= bytes;
-	}
-	else
-	{
-		m_receive_buffer_capacity -= m_receive_buffer_surplus;
-		m_receive_buffer_surplus = 0;
-	}
+	TORRENT_ASSERT(bytes > 0);
+	const int delta = m_receive_buffer_capacity - m_desired_receive_buffer_capacity;
+	if (delta == 0)
+		return;
+	TORRENT_ASSERT(delta > 0);
+	m_receive_buffer_capacity -= std::min(bytes, delta);
 }
 
 void utp_socket_impl::parse_close_reason(boost::uint8_t const* ptr, int size)
@@ -2512,8 +2523,8 @@ void utp_socket_impl::ack_packet(packet* p, time_point const& receive_time
 		m_min_rtt = min_rtt;
 		// and tune receive buffer size according to it
 		boost::int32_t const new_capacity = get_optimized_receive_buf_capacity(m_min_rtt/1000);
-		// m_min_rtt should never increase, but the buffer size could be
-		// increased from its default value after the first RTT. The
+		// m_min_rtt should never increase, but the buffer size could
+		// increase from its default value after the first RTT. The
 		// evolution of buffer size in accord with min_rtt happens like
 		// this:                       +------------------------------+-----------+----------------+
 		//                             | start                        | first RTT | following RTTs |
@@ -2522,13 +2533,7 @@ void utp_socket_impl::ack_packet(packet* p, time_point const& receive_time
 		// +---------------------------+------------------------------+-----------+----------------+
 		// | m_receive_buffer_capacity | 1 MByte                      | increase  | decrease       |
 		// +---------------------------+------------------------------+-----------+----------------+
-		// We only use surplus mechanism if the capacity should really
-		// decrease. In case it should increase (e.g. after the first RTT),
-		// we change it directly.
-		if (new_capacity <= m_receive_buffer_capacity - m_receive_buffer_surplus)
-			m_receive_buffer_surplus += (m_receive_buffer_capacity - m_receive_buffer_surplus - new_capacity);
-		else
-			m_receive_buffer_capacity = new_capacity;
+		set_desired_receive_buf_capacity(new_capacity);
 	}
 
 	free(p);
