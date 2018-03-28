@@ -140,7 +140,7 @@ enum
 	// to be used as floor and ceiling values by algorithm,
 	// that dynamically determines m_receive_buffer_capacity
 	receive_buffer_capacity_min = 1024*1024,
-	receive_buffer_capacity_max = 8 * receive_buffer_capacity_min,
+	receive_buffer_capacity_max = 4 * receive_buffer_capacity_min,
 
 	// if a packet receives more than this number of
 	// duplicate acks, we'll trigger a fast re-send
